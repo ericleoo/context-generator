@@ -5,7 +5,7 @@ CLI tool to concatenate contents of multiple files with filename headers.
 ## Usage
 
 ```bash
-./generate-context.sh [options] [paths...]
+./generate-context [options] [paths...]
 ```
 
 ## Options
@@ -19,14 +19,14 @@ CLI tool to concatenate contents of multiple files with filename headers.
 
 ```bash
 # Concatenate specific files
-./generate-context.sh src/main.py src/utils.py
+./generate-context src/main.py src/utils.py
 
 # Use glob patterns
-./generate-context.sh "src/**/*.ts"
+./generate-context "src/**/*.ts"
 
 # Process entire directory
-./generate-context.sh src/
+./generate-context src/
 
 # Include binary files
-./generate-context.sh --include-binary assets/
+./generate-context --include-binary assets/
 ```
