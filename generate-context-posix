@@ -52,6 +52,11 @@ fi
 # --------------------------------------------------------------------
 # helper functions
 # --------------------------------------------------------------------
+canonicalize() {
+  # output canonical absolute path, fallback to original if unavailable
+  readlink -f "$1" 2>/dev/null || echo "$1"
+}
+
 expand_path() {
   # Prints one existing file path per line for a given pattern/directory.
   pattern="$1"
@@ -60,16 +65,29 @@ expand_path() {
     return
   fi
 
-  found=0
-  for f in $pattern; do
-    if [ -e "$f" ]; then
-      printf '%s\n' "$f"
-      found=1
-    fi
-  done
-  if [ "$found" -eq 0 ] && [ -f "$pattern" ]; then
-    printf '%s\n' "$pattern"
-  fi
+  # If the pattern contains no wildcards, treat it as a literal path
+  case "$pattern" in
+    *\**|*\?*|*\**)
+      # globbing: unquoted expansion (pattern must not contain spaces)
+      found=0
+      for f in $pattern; do
+        if [ -e "$f" ]; then
+          printf '%s\n' "$f"
+          found=1
+        fi
+      done
+      # If no matches, and the literal string is a file, output it
+      if [ "$found" -eq 0 ] && [ -f "$pattern" ]; then
+        printf '%s\n' "$pattern"
+      fi
+      ;;
+    *)
+      # literal path: just check if it exists
+      if [ -f "$pattern" ]; then
+        printf '%s\n' "$pattern"
+      fi
+      ;;
+  esac
 }
 
 is_binary() {
@@ -104,12 +122,12 @@ dedupfile=$(mktemp) || exit 1
 textfile=$(mktemp) || exit 1
 trap 'rm -f "$rawfile" "$dedupfile" "$textfile"' EXIT
 
-# 1. expand patterns/directories -> canonical (real) paths
+# 1. expand patterns/directories -> canonical absolute paths
 {
   while IFS= read -r p; do
     [ -z "$p" ] && continue
     expand_path "$p" | while IFS= read -r f; do
-      realpath "$f" 2>/dev/null || true
+      canonicalize "$f"
     done
   done <<EOF
 $PATHS
@@ -143,6 +161,7 @@ fi
 total=$(wc -l < "$textfile")
 i=1
 while IFS= read -r file; do
+  # Try to get a relative path, fallback to original
   display_path=$(realpath --relative-to=. "$file" 2>/dev/null || echo "$file")
   printf '%s:\n```\n' "$display_path"
   cat "$file" 2>/dev/null || echo "Error: Could not read $file" >&2
