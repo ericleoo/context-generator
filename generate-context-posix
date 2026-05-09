@@ -1,19 +1,13 @@
 #!/bin/sh
-
+# generate-context -- concatenate files with headers (alpine ash compatible)
 set -eu
 
 VERSION="1.0.0"
-INCLUDE_BINARY=false
-
-# Temp files substituting for arrays
-PATHS_FILE=$(mktemp)
-ALL_FILES=$(mktemp)
-UNIQUE_FILES=$(mktemp)
-TEXT_FILES=$(mktemp)
-trap 'rm -f "$PATHS_FILE" "$ALL_FILES" "$UNIQUE_FILES" "$TEXT_FILES"' EXIT INT TERM
+INCLUDE_BINARY=0
+PATHS=""
 
 usage() {
-    cat <<EOF
+  cat <<'EOF'
 Usage: generate-context [options] [paths...]
 
 Concatenate contents of multiple files, globs, or directories with filename headers
@@ -29,193 +23,132 @@ Arguments:
 EOF
 }
 
-# Parse arguments
+# argument parsing ----------------------------------------------------
+add_path() {
+  if [ -z "$PATHS" ]; then
+    PATHS="$1"
+  else
+    PATHS="$PATHS
+$1"
+  fi
+}
+
 while [ $# -gt 0 ]; do
-    case "$1" in
-        --include-binary)
-            INCLUDE_BINARY=true
-            shift
-            ;;
-        --exclude-binary)
-            INCLUDE_BINARY=false
-            shift
-            ;;
-        --help)
-            usage
-            exit 0
-            ;;
-        --version)
-            echo "$VERSION"
-            exit 0
-            ;;
-        -*)
-            echo "Error: Unknown option: $1" >&2
-            exit 1
-            ;;
-        *)
-            printf '%s\n' "$1" >> "$PATHS_FILE"
-            shift
-            ;;
-    esac
+  case "$1" in
+    --include-binary) INCLUDE_BINARY=1; shift ;;
+    --exclude-binary) INCLUDE_BINARY=0; shift ;;
+    --help) usage; exit 0 ;;
+    --version) echo "$VERSION"; exit 0 ;;
+    -*) echo "Error: Unknown option: $1" >&2; exit 1 ;;
+    *) add_path "$1"; shift ;;
+  esac
 done
 
-if [ ! -s "$PATHS_FILE" ]; then
-    echo "Error: No paths specified" >&2
-    exit 1
+if [ -z "$PATHS" ]; then
+  echo "Error: No paths specified" >&2
+  exit 1
 fi
 
-# Read N bytes from a file into stdout.
-# Usage: read_bytes FILE N
-# Uses dd which is universally available, including BusyBox.
-read_bytes() {
-    dd if="$1" bs=1 count="$2" 2>/dev/null
-}
-
-# Expand a single pattern/path into actual files, one per line on stdout
+# --------------------------------------------------------------------
+# helper functions
+# --------------------------------------------------------------------
 expand_path() {
-    pattern="$1"
+  # Prints one existing file path per line for a given pattern/directory.
+  pattern="$1"
+  if [ -d "$pattern" ]; then
+    find "$pattern" -type f -print 2>/dev/null
+    return
+  fi
 
-    if [ -d "$pattern" ]; then
-        find "$pattern" -type f -print
-        return
+  found=0
+  for f in $pattern; do
+    if [ -e "$f" ]; then
+      printf '%s\n' "$f"
+      found=1
     fi
-
-    # Glob expansion: temporarily enable globbing
-    set +f
-    for f in $pattern; do
-        set -f
-        if [ -e "$f" ]; then
-            printf '%s\n' "$f"
-        elif [ -f "$pattern" ]; then
-            printf '%s\n' "$pattern"
-        fi
-        set +f
-    done
-    set -f
+  done
+  if [ "$found" -eq 0 ] && [ -f "$pattern" ]; then
+    printf '%s\n' "$pattern"
+  fi
 }
 
-# Check if a file is binary.
-# Returns 0 (true) if binary, 1 (false) if text.
 is_binary() {
-    file="$1"
+  # Returns 0 (true) if the file looks binary, 1 (false) otherwise.
+  file="$1"
 
-    # Empty files are treated as text
-    if [ ! -s "$file" ]; then
-        return 1
-    fi
+  [ ! -s "$file" ] && return 1   # empty files are treated as text
 
-    # Check for null bytes in first 8KB using dd + tr + wc
-    first8k=$(read_bytes "$file" 8192)
-    with_nulls=$(printf '%s' "$first8k" | wc -c)
-    without_nulls=$(printf '%s' "$first8k" | tr -d '\000' | wc -c)
-    if [ "$with_nulls" -ne "$without_nulls" ]; then
-        return 0
-    fi
+  # check for null bytes in first 8KB
+  total=$(head -c 8192 "$file" 2>/dev/null | wc -c)
+  nonull=$(head -c 8192 "$file" 2>/dev/null | tr -d '\000' | wc -c)
+  if [ "$total" -ne "$nonull" ]; then
+    return 0
+  fi
 
-    # Check printable character ratio in first 1KB
-    first1k=$(read_bytes "$file" 1024)
-    total=$(printf '%s' "$first1k" | wc -c)
+  # printable character ratio in first 1KB
+  total=$(head -c 1024 "$file" 2>/dev/null | wc -c)
+  [ "$total" -eq 0 ] && return 1
+  printable=$(head -c 1024 "$file" 2>/dev/null | tr -cd '[:print:]\t\n\r' | wc -c)
+  if [ $((printable * 100 / total)) -lt 80 ]; then
+    return 0
+  fi
 
-    if [ "$total" -eq 0 ]; then
-        return 1
-    fi
-
-    printable=$(printf '%s' "$first1k" | tr -cd '[:print:]\t\n\r' | wc -c)
-
-    # If less than 80% printable, consider binary
-    if [ $(( printable * 100 / total )) -lt 80 ]; then
-        return 0
-    fi
-
-    return 1
+  return 1
 }
 
-# Resolve a path to an absolute path
-abspath() {
-    _path="$1"
-    case "$_path" in
-        /*)
-            printf '%s\n' "$_path"
-            ;;
-        *)
-            printf '%s/%s\n' "$(pwd)" "$_path"
-            ;;
-    esac
-}
+# --------------------------------------------------------------------
+# main logic
+# --------------------------------------------------------------------
+rawfile=$(mktemp) || exit 1
+dedupfile=$(mktemp) || exit 1
+textfile=$(mktemp) || exit 1
+trap 'rm -f "$rawfile" "$dedupfile" "$textfile"' EXIT
 
-# Compute a path relative to the current directory
-relative_to_cwd() {
-    _abs="$1"
-    _cwd="$(pwd)"
-    case "$_abs" in
-        "${_cwd}/")
-            printf '.\n'
-            ;;
-        "${_cwd}/"*|"${_cwd}")
-            printf '%s\n' "${_abs#"${_cwd}/"}"
-            ;;
-        *)
-            printf '%s\n' "$_abs"
-            ;;
-    esac
-}
+# 1. expand patterns/directories -> canonical (real) paths
+{
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    expand_path "$p" | while IFS= read -r f; do
+      realpath "$f" 2>/dev/null || true
+    done
+  done <<EOF
+$PATHS
+EOF
+} > "$rawfile"
 
-# Collect all files
-set -f
-while IFS= read -r p; do
-    set +f
-    expand_path "$p" >> "$ALL_FILES"
-    set -f
-done < "$PATHS_FILE"
-set +f
+# 2. deduplicate, preserving order
+awk '!seen[$0]++' "$rawfile" > "$dedupfile"
 
-# Deduplicate while preserving order using awk
-while IFS= read -r file; do
-    [ -z "$file" ] && continue
-    abs="$(abspath "$file")"
-    printf '%s\t%s\n' "$abs" "$file"
-done < "$ALL_FILES" | awk -F'\t' '!seen[$1]++ { print $2 }' > "$UNIQUE_FILES"
-
-if [ ! -s "$UNIQUE_FILES" ]; then
-    echo "Error: No matching files found" >&2
-    exit 1
-fi
-
-# Filter binary files unless explicitly requested
-SKIPPED=0
+# 3. filter binary files
+skipped=0
+> "$textfile"  # empty the file
 while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    if [ "$INCLUDE_BINARY" = true ] || ! is_binary "$f"; then
-        printf '%s\n' "$f" >> "$TEXT_FILES"
-    else
-        SKIPPED=$(( SKIPPED + 1 ))
-    fi
-done < "$UNIQUE_FILES"
+  if [ "$INCLUDE_BINARY" -eq 1 ] || ! is_binary "$f"; then
+    printf '%s\n' "$f" >> "$textfile"
+  else
+    skipped=$((skipped + 1))
+  fi
+done < "$dedupfile"
 
-if [ ! -s "$TEXT_FILES" ]; then
-    echo "Error: No text files found" >&2
-    exit 1
+if [ ! -s "$textfile" ]; then
+  echo "Error: No text files found" >&2
+  exit 1
 fi
 
-if [ "$INCLUDE_BINARY" != true ] && [ "$SKIPPED" -gt 0 ]; then
-    echo "Skipped $SKIPPED binary file(s). Use --include-binary to include them." >&2
+if [ "$INCLUDE_BINARY" -eq 0 ] && [ "$skipped" -gt 0 ]; then
+  echo "Skipped $skipped binary file(s). Use --include-binary to include them." >&2
 fi
 
-# Generate output
-TOTAL=$(wc -l < "$TEXT_FILES")
-INDEX=0
-
+# 4. generate context output
+total=$(wc -l < "$textfile")
+i=1
 while IFS= read -r file; do
-    INDEX=$(( INDEX + 1 ))
-    abs="$(abspath "$file")"
-    display_path="$(relative_to_cwd "$abs")"
-
-    printf '%s:\n' "$display_path"
-    printf '```\n'
-    cat "$file" 2>/dev/null || echo "Error: Could not read $file" >&2
-    printf '```\n'
-
-    if [ "$INDEX" -lt "$TOTAL" ]; then
-        echo
-    fi
-done < "$TEXT_FILES"
+  display_path=$(realpath --relative-to=. "$file" 2>/dev/null || echo "$file")
+  printf '%s:\n```\n' "$display_path"
+  cat "$file" 2>/dev/null || echo "Error: Could not read $file" >&2
+  printf '```\n'
+  if [ "$i" -lt "$total" ]; then
+    echo
+  fi
+  i=$((i + 1))
+done < "$textfile"
