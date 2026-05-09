@@ -57,6 +57,26 @@ canonicalize() {
   readlink -f "$1" 2>/dev/null || echo "$1"
 }
 
+# Portable relative path: compute path of $1 relative to $PWD
+relpath() {
+  target=$(canonicalize "$1")
+  base=$(pwd)
+  # Remove trailing slash from base if any
+  case "$base" in
+    */) base=${base%/} ;;
+  esac
+  # If target is exactly base, print "."
+  if [ "$target" = "$base" ]; then
+    echo "."
+    return
+  fi
+  # If target starts with base/, strip base/
+  case "$target" in
+    "$base/"*) echo "${target#$base/}" ;;
+    *) echo "$target" ;;
+  esac
+}
+
 expand_path() {
   # Prints one existing file path per line for a given pattern/directory.
   pattern="$1"
@@ -67,7 +87,7 @@ expand_path() {
 
   # If the pattern contains no wildcards, treat it as a literal path
   case "$pattern" in
-    *\**|*\?*|*\**)
+    *\**|*\?*)
       # globbing: unquoted expansion (pattern must not contain spaces)
       found=0
       for f in $pattern; do
@@ -154,8 +174,8 @@ fi
 total=$(wc -l < "$textfile")
 i=1
 while IFS= read -r file; do
-  # Try to get a relative path, fallback to original
-  display_path=$(realpath --relative-to=. "$file" 2>/dev/null || echo "$file")
+  # Use portable relative path
+  display_path=$(relpath "$file")
   printf '%s:\n```\n' "$display_path"
   cat "$file" 2>/dev/null || echo "Error: Could not read $file" >&2
   printf '```\n'
