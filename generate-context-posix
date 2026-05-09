@@ -103,14 +103,7 @@ is_binary() {
     return 0
   fi
 
-  # printable character ratio in first 1KB
-  total=$(head -c 1024 "$file" 2>/dev/null | wc -c)
-  [ "$total" -eq 0 ] && return 1
-  printable=$(head -c 1024 "$file" 2>/dev/null | tr -cd '[:print:]\t\n\r' | wc -c)
-  if [ $((printable * 100 / total)) -lt 80 ]; then
-    return 0
-  fi
-
+  # No null bytes found -- treat as text
   return 1
 }
 
