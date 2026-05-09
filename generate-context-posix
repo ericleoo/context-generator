@@ -4,9 +4,13 @@ set -eu
 
 VERSION="1.0.0"
 INCLUDE_BINARY=false
-# Use a temp file to collect paths since POSIX sh lacks arrays
+
+# Temp files substituting for arrays
 PATHS_FILE=$(mktemp)
-trap 'rm -f "$PATHS_FILE"' EXIT
+ALL_FILES=$(mktemp)
+UNIQUE_FILES=$(mktemp)
+TEXT_FILES=$(mktemp)
+trap 'rm -f "$PATHS_FILE" "$ALL_FILES" "$UNIQUE_FILES" "$TEXT_FILES"' EXIT INT TERM
 
 usage() {
     cat <<EOF
@@ -60,36 +64,34 @@ if [ ! -s "$PATHS_FILE" ]; then
     exit 1
 fi
 
-# Expand a single pattern/path into actual files, printed to stdout one per line.
-# Each line is NUL-terminated to handle filenames with newlines.
+# Read N bytes from a file into stdout.
+# Usage: read_bytes FILE N
+# Uses dd which is universally available, including BusyBox.
+read_bytes() {
+    dd if="$1" bs=1 count="$2" 2>/dev/null
+}
+
+# Expand a single pattern/path into actual files, one per line on stdout
 expand_path() {
     pattern="$1"
 
-    # Check if it's a directory
     if [ -d "$pattern" ]; then
         find "$pattern" -type f -print
         return
     fi
 
-    # Try glob expansion via set --
-    # Save and restore positional parameters around this
+    # Glob expansion: temporarily enable globbing
     set +f
-    # shellcheck disable=SC2086
-    set -- $pattern
+    for f in $pattern; do
+        set -f
+        if [ -e "$f" ]; then
+            printf '%s\n' "$f"
+        elif [ -f "$pattern" ]; then
+            printf '%s\n' "$pattern"
+        fi
+        set +f
+    done
     set -f
-
-    # If glob expanded to something real, print each match
-    if [ -e "$1" ]; then
-        for f do
-            [ -e "$f" ] && printf '%s\n' "$f"
-        done
-        return
-    fi
-
-    # If the literal path exists as a file, print it
-    if [ -f "$pattern" ]; then
-        printf '%s\n' "$pattern"
-    fi
 }
 
 # Check if a file is binary.
@@ -102,22 +104,23 @@ is_binary() {
         return 1
     fi
 
-    # Check for null bytes in first 8KB using tr and wc
-    # tr -d deletes the given chars; if the count changes there were null bytes
-    first8k=$(head -c 8192 "$file" 2>/dev/null)
-    without_nulls=$(printf '%s' "$first8k" | tr -d '\000' | wc -c)
+    # Check for null bytes in first 8KB using dd + tr + wc
+    first8k=$(read_bytes "$file" 8192)
     with_nulls=$(printf '%s' "$first8k" | wc -c)
+    without_nulls=$(printf '%s' "$first8k" | tr -d '\000' | wc -c)
     if [ "$with_nulls" -ne "$without_nulls" ]; then
         return 0
     fi
 
     # Check printable character ratio in first 1KB
-    total=$(head -c 1024 "$file" 2>/dev/null | wc -c)
+    first1k=$(read_bytes "$file" 1024)
+    total=$(printf '%s' "$first1k" | wc -c)
+
     if [ "$total" -eq 0 ]; then
         return 1
     fi
 
-    printable=$(head -c 1024 "$file" 2>/dev/null | tr -cd '[:print:]\t\n\r' | wc -c)
+    printable=$(printf '%s' "$first1k" | tr -cd '[:print:]\t\n\r' | wc -c)
 
     # If less than 80% printable, consider binary
     if [ $(( printable * 100 / total )) -lt 80 ]; then
@@ -127,7 +130,7 @@ is_binary() {
     return 1
 }
 
-# Resolve a path to an absolute path without relying on realpath(1)
+# Resolve a path to an absolute path
 abspath() {
     _path="$1"
     case "$_path" in
@@ -140,16 +143,15 @@ abspath() {
     esac
 }
 
-# Compute a path relative to the current directory without relying on realpath(1)
+# Compute a path relative to the current directory
 relative_to_cwd() {
     _abs="$1"
     _cwd="$(pwd)"
-    # Strip leading cwd + slash if present
     case "$_abs" in
         "${_cwd}/")
             printf '.\n'
             ;;
-        "${_cwd}/"|"${_cwd}")
+        "${_cwd}/"*|"${_cwd}")
             printf '%s\n' "${_abs#"${_cwd}/"}"
             ;;
         *)
@@ -158,11 +160,8 @@ relative_to_cwd() {
     esac
 }
 
-# Collect all files into a temp file (one path per line)
-ALL_FILES=$(mktemp)
-trap 'rm -f "$PATHS_FILE" "$ALL_FILES"' EXIT
-
-set -f  # Disable glob expansion while reading paths
+# Collect all files
+set -f
 while IFS= read -r p; do
     set +f
     expand_path "$p" >> "$ALL_FILES"
@@ -170,11 +169,7 @@ while IFS= read -r p; do
 done < "$PATHS_FILE"
 set +f
 
-# Remove duplicates while preserving order.
-# We use a second temp file and awk to track seen absolute paths.
-UNIQUE_FILES=$(mktemp)
-trap 'rm -f "$PATHS_FILE" "$ALL_FILES" "$UNIQUE_FILES"' EXIT
-
+# Deduplicate while preserving order using awk
 while IFS= read -r file; do
     [ -z "$file" ] && continue
     abs="$(abspath "$file")"
@@ -186,10 +181,7 @@ if [ ! -s "$UNIQUE_FILES" ]; then
     exit 1
 fi
 
-# Filter binary files unless explicitly requested.
-TEXT_FILES=$(mktemp)
-trap 'rm -f "$PATHS_FILE" "$ALL_FILES" "$UNIQUE_FILES" "$TEXT_FILES"' EXIT
-
+# Filter binary files unless explicitly requested
 SKIPPED=0
 while IFS= read -r f; do
     [ -z "$f" ] && continue
@@ -209,7 +201,7 @@ if [ "$INCLUDE_BINARY" != true ] && [ "$SKIPPED" -gt 0 ]; then
     echo "Skipped $SKIPPED binary file(s). Use --include-binary to include them." >&2
 fi
 
-# Count lines for last-index detection
+# Generate output
 TOTAL=$(wc -l < "$TEXT_FILES")
 INDEX=0
 
